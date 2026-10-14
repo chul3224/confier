@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>레시피 알러지 챗봇</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🍽️ 레시피 알러지 챗봇</h1>
+      <p class="subtitle">한국 식약처 기준 22가지 알러지 유발 식품을 레시피에서 확인합니다</p>
+    </header>
+
+    <div class="sidebar">
+      <section class="upload-section">
+        <h2>📄 레시피 PDF 업로드</h2>
+        <label class="upload-label">
+          <input type="file" id="pdfInput" accept=".pdf" />
+          <span>파일 선택</span>
+        </label>
+        <button id="uploadBtn" class="btn-primary">업로드</button>
+        <div id="uploadStatus" class="status-msg"></div>
+      </section>
+
+      <section class="files-section">
+        <h2>📚 인덱싱된 파일</h2>
+        <ul id="fileList" class="file-list"><li class="empty">업로드된 파일 없음</li></ul>
+      </section>
+
+      <section class="allergen-section">
+        <h2>⚠️ 식약처 22종 알러지</h2>
+        <div id="allergenTags" class="allergen-tags"></div>
+      </section>
+    </div>
+
+    <main class="chat-area">
+      <div id="chatMessages" class="chat-messages">
+        <div class="message bot-message">
+          <div class="bubble">
+            안녕하세요! 레시피의 알러지 성분을 확인해 드립니다.<br />
+            PDF 레시피를 업로드하거나, 직접 재료를 입력해 물어보세요.<br />
+            <em>예: "이 레시피에 땅콩 알러지가 있나요?"</em>
+          </div>
+        </div>
+      </div>
+
+      <div class="chat-input-area">
+        <textarea
+          id="chatInput"
+          placeholder="알러지 관련 질문을 입력하세요..."
+          rows="2"
+        ></textarea>
+        <button id="sendBtn" class="btn-send">전송</button>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    let history = [];
+
+    async function loadStatus() {
+      const res = await fetch("/status");
+      const data = await res.json();
+
+      const fileList = document.getElementById("fileList");
+      if (data.indexed_files.length === 0) {
+        fileList.innerHTML = '<li class="empty">업로드된 파일 없음</li>';
+      } else {
+        fileList.innerHTML = data.indexed_files
+          .map((f) => `<li>📄 ${f}</li>`)
+          .join("");
+      }
+
+      const tagsEl = document.getElementById("allergenTags");
+      tagsEl.innerHTML = data.allergens
+        .map((a) => `<span class="tag">${a}</span>`)
+        .join("");
+    }
+
+    async function uploadPDF() {
+      const input = document.getElementById("pdfInput");
+      const statusEl = document.getElementById("uploadStatus");
+      if (!input.files[0]) {
+        statusEl.textContent = "파일을 선택해주세요.";
+        statusEl.className = "status-msg error";
+        return;
+      }
+      const formData = new FormData();
+      formData.append("file", input.files[0]);
+      statusEl.textContent = "업로드 중...";
+      statusEl.className = "status-msg loading";
+      try {
+        const res = await fetch("/upload", { method: "POST", body: formData });
+        const data = await res.json();
+        if (res.ok) {
+          statusEl.textContent = data.message;
+          statusEl.className = "status-msg success";
+          await loadStatus();
+        } else {
+          statusEl.textContent = data.detail;
+          statusEl.className = "status-msg error";
+        }
+      } catch {
+        statusEl.textContent = "업로드 실패";
+        statusEl.className = "status-msg error";
+      }
+    }
+
+    function appendMessage(role, text, allergens, sources) {
+      const container = document.getElementById("chatMessages");
+      const div = document.createElement("div");
+      div.className = `message ${role === "user" ? "user-message" : "bot-message"}`;
+
+      let inner = `<div class="bubble">${text.replace(/\n/g, "<br/>")}</div>`;
+
+      if (allergens && allergens.length > 0) {
+        inner += `<div class="allergen-alert">⚠️ 감지된 알러지: ${allergens.map((a) => `<span class="alert-tag">${a}</span>`).join(" ")}</div>`;
+      }
+      if (sources && sources.length > 0) {
+        inner += `<div class="sources">📄 출처: ${sources.join(", ")}</div>`;
+      }
+
+      div.innerHTML = inner;
+      container.appendChild(div);
+      container.scrollTop = container.scrollHeight;
+    }
+
+    async function sendMessage() {
+      const input = document.getElementById("chatInput");
+      const msg = input.value.trim();
+      if (!msg) return;
+
+      input.value = "";
+      appendMessage("user", msg);
+      history.push({ role: "user", content: msg });
+
+      const sendBtn = document.getElementById("sendBtn");
+      sendBtn.disabled = true;
+      sendBtn.textContent = "...";
+
+      const loadingDiv = document.createElement("div");
+      loadingDiv.className = "message bot-message loading-indicator";
+      loadingDiv.innerHTML = '<div class="bubble">답변 생성 중...</div>';
+      document.getElementById("chatMessages").appendChild(loadingDiv);
+
+      try {
+        const res = await fetch("/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: msg, history: history.slice(-6) }),
+        });
+        const data = await res.json();
+        loadingDiv.remove();
+
+        if (res.ok) {
+          appendMessage("bot", data.answer, data.detected_allergens, data.sources);
+          history.push({ role: "assistant", content: data.answer });
+        } else {
+          appendMessage("bot", `오류: ${data.detail}`);
+        }
+      } catch {
+        loadingDiv.remove();
+        appendMessage("bot", "서버 연결 오류가 발생했습니다.");
+      } finally {
+        sendBtn.disabled = false;
+        sendBtn.textContent = "전송";
+      }
+    }
+
+    document.getElementById("sendBtn").addEventListener("click", sendMessage);
+    document.getElementById("uploadBtn").addEventListener("click", uploadPDF);
+    document.getElementById("chatInput").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
+    loadStatus();
+  </script>
+</body>
+</html>
