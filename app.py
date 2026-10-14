@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -23,6 +24,10 @@ rag: RecipeRAG | None = None
 menu_db: dict = {}
 
 
+# ─────────────────────────────────────────────
+# DB 로드
+# ─────────────────────────────────────────────
+
 def load_menu_db():
     global menu_db
     if MENU_JSON.exists():
@@ -30,30 +35,42 @@ def load_menu_db():
             menu_db = json.load(f)
 
 
-import re as _re
+# ─────────────────────────────────────────────
+# 쿼리 유형 판별 & 컨텍스트 빌더
+# ─────────────────────────────────────────────
 
 _SKIP_TOKENS = {"코스", "단품", "잠실", "3가지"}
+_RECOMMEND_KW = ["추천", "먹을 수 있", "괜찮은", "안전한", "피해야", "어떤 메뉴", "뭐 먹", "전체", "모든 메뉴"]
+
 
 def find_matching_menus(query: str) -> list[tuple[str, dict]]:
-    """쿼리에서 메뉴명 매칭 — _와 공백 모두 분리, 양방향 포함 검사."""
-    matches = []
+    """메뉴명 키워드가 쿼리에 있으면 반환."""
     q = query.lower().replace(" ", "")
+    matches = []
     for name, info in menu_db.items():
-        # 메뉴명을 _ 와 공백으로 분리해 의미 있는 토큰 추출
-        tokens = [t for t in _re.split(r"[_\s]+", name.lower())
+        tokens = [t for t in re.split(r"[_\s]+", name.lower())
                   if len(t) > 1 and t not in _SKIP_TOKENS]
-        # 메뉴 토큰이 쿼리에 포함되거나, 쿼리 단어가 메뉴명에 포함되면 매칭
         name_flat = name.lower().replace(" ", "")
-        query_words = [w for w in _re.split(r"\s+", query.lower()) if len(w) > 1]
+        query_words = [w for w in re.split(r"\s+", query.lower()) if len(w) > 1]
         if any(t in q for t in tokens) or any(w in name_flat for w in query_words):
             matches.append((name, info))
     return matches
 
 
+def find_menus_by_allergen(allergens: list[str]) -> dict[str, list[tuple]]:
+    """알러지명 → 해당 알러지 포함 메뉴 역방향 조회."""
+    result = {}
+    for allergen in allergens:
+        affected = [
+            (name, info) for name, info in menu_db.items()
+            if allergen in info.get("allergens", [])
+        ]
+        result[allergen] = affected
+    return result
+
+
 def build_menu_context(matches: list[tuple[str, dict]]) -> str:
-    if not matches:
-        return ""
-    lines = ["[메뉴 알러지 데이터베이스 조회 결과]"]
+    lines = ["[메뉴 알러지 DB 조회 결과]"]
     for name, info in matches:
         allergen_str = ", ".join(info["allergens"]) if info["allergens"] else "없음"
         lines.append(f"\n● {name} ({info['category']})")
@@ -63,8 +80,38 @@ def build_menu_context(matches: list[tuple[str, dict]]) -> str:
     return "\n".join(lines)
 
 
+_SAFE_MENU_KW = ["주문 가능", "먹을 수 있", "괜찮", "안전", "추천", "피해서", "제외하고", "뭐 먹"]
+
+
+def build_allergen_context(allergen_results: dict[str, list], show_safe: bool = False) -> str:
+    """알러지 역방향 조회 결과 컨텍스트. show_safe=True면 안전 메뉴 목록도 포함."""
+    lines = ["[알러지 기반 메뉴 조회 결과]"]
+    dangerous_names: set[str] = set()
+
+    for allergen, menus in allergen_results.items():
+        if not menus:
+            lines.append(f"\n● {allergen}: 현재 메뉴 중 해당 알러지 포함 메뉴 없음 → 모든 메뉴 주문 가능")
+        else:
+            lines.append(f"\n● {allergen} 포함 메뉴 ({len(menus)}개) — 주문 불가:")
+            for name, info in menus:
+                srcs = info["allergen_sources"].get(allergen, [])
+                lines.append(f"  ✗ {name} ({info['category']}) / 유발 재료: {', '.join(srcs)}")
+                dangerous_names.add(name)
+
+    if show_safe and menu_db:
+        safe = [(n, i) for n, i in menu_db.items() if n not in dangerous_names]
+        if safe:
+            lines.append(f"\n● 주문 가능 메뉴 ({len(safe)}개):")
+            for name, info in safe:
+                other_allergens = ", ".join(info["allergens"]) if info["allergens"] else "알러지 없음"
+                lines.append(f"  ✓ {name} ({info['category']}) / 기타 알러지: {other_allergens}")
+        else:
+            lines.append("\n● 주문 가능 메뉴: 없음 (모든 메뉴에 해당 알러지 포함)")
+
+    return "\n".join(lines)
+
+
 def build_full_menu_summary() -> str:
-    """전체 메뉴 알러지 요약 (추천/회피 질문용)."""
     if not menu_db:
         return ""
     lines = ["[전체 메뉴 알러지 현황]"]
@@ -74,11 +121,54 @@ def build_full_menu_summary() -> str:
     return "\n".join(lines)
 
 
-RECOMMEND_KEYWORDS = ["추천", "먹을 수 있", "괜찮은", "안전한", "피해야", "어떤 메뉴", "뭐 먹", "전체", "모든 메뉴"]
+def classify_query(query: str) -> tuple[str, list]:
+    """
+    쿼리 유형 분류.
+    반환: (유형, 추가 데이터)
+      'menu'      → 매칭된 메뉴 리스트
+      'allergen'  → 감지된 알러지 리스트
+      'recommend' → []
+      'general'   → []
+    """
+    # 1순위: 메뉴명 직접 매칭
+    matched_menus = find_matching_menus(query)
+    if matched_menus:
+        return "menu", matched_menus
 
-def is_recommendation_query(query: str) -> bool:
-    return any(kw in query for kw in RECOMMEND_KEYWORDS)
+    # 2순위: 알러지명 감지 (역방향 조회)
+    detected = detect_allergens_in_text(query)
+    if detected:
+        return "allergen", detected
 
+    # 3순위: 추천/회피 질문
+    if any(kw in query for kw in _RECOMMEND_KW):
+        return "recommend", []
+
+    return "general", []
+
+
+# ─────────────────────────────────────────────
+# 시스템 프롬프트
+# ─────────────────────────────────────────────
+
+SYSTEM_PROMPT = """당신은 홀 직원을 위한 레시피 알러지 안내 챗봇입니다.
+한국 식약처 기준 22가지 알러지 유발 식품을 기반으로 답변합니다.
+
+식약처 알러지 유발 22종: {allergens}
+
+{context}
+
+[답변 규칙]
+1. 조회 결과가 있으면 반드시 그 데이터를 근거로 답변하세요.
+2. 알러지 포함 여부와 유발 재료를 명확히 안내하세요.
+3. 레시피 세부 내용(배합비율, 조리법)은 절대 포함하지 마세요.
+4. 대체 재료 제안은 현재 지원되지 않습니다. 요청 시 "추후 업데이트 예정"이라고만 답하세요.
+5. 짧고 명확하게 한국어로 답변하세요."""
+
+
+# ─────────────────────────────────────────────
+# FastAPI 앱
+# ─────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -92,24 +182,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="레시피 알러지 챗봇", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
-
-
-SYSTEM_PROMPT = """당신은 레시피 알러지 전문가 챗봇입니다.
-한국 식품의약품안전처(식약처) 기준 22가지 알러지 유발 식품을 기반으로 답변합니다.
-
-식약처 알러지 유발 22종: {allergens}
-
-{menu_context}
-
-{rag_context}
-
-답변 규칙:
-1. 메뉴 데이터베이스 조회 결과가 있으면 그것을 우선으로 답변하세요.
-2. 알러지 유발 성분과 그 유발 재료를 명확히 알려주세요.
-3. 알러지가 없으면 안전하다고 알려주세요.
-4. 레시피 세부 내용(배합비율, 조리법)은 답변에 포함하지 마세요.
-5. 불확실한 경우 솔직히 말씀해주세요.
-6. 한국어로 답변하세요."""
 
 
 class ChatRequest(BaseModel):
@@ -128,31 +200,35 @@ async def chat(req: ChatRequest):
     if not query:
         raise HTTPException(status_code=400, detail="메시지를 입력해주세요.")
 
-    # 1. 메뉴 DB 직접 조회
-    matched_menus = find_matching_menus(query)
-    if matched_menus:
-        menu_context = build_menu_context(matched_menus)
-    elif is_recommendation_query(query):
-        menu_context = build_full_menu_summary()
-    else:
-        menu_context = ""
+    query_type, data = classify_query(query)
 
-    # 2. RAG 보조 검색
-    chunks = rag.query(query, n_results=2) if not matched_menus else []
-    if chunks:
-        rag_context = "[레시피 문서 검색 결과]\n" + "\n\n---\n\n".join(
-            f"[{c['source']}]\n{c['text']}" for c in chunks
-        )
-    else:
-        rag_context = ""
+    if query_type == "menu":
+        context = build_menu_context(data)
+        response_allergens = list({a for _, info in data for a in info.get("allergens", [])})
+        sources = [name for name, _ in data]
 
-    if not menu_context and not rag_context:
-        rag_context = "현재 참조할 레시피 데이터가 없습니다."
+    elif query_type == "allergen":
+        allergen_results = find_menus_by_allergen(data)
+        show_safe = any(kw in query for kw in _SAFE_MENU_KW)
+        context = build_allergen_context(allergen_results, show_safe=show_safe)
+        response_allergens = data
+        sources = [name for menus in allergen_results.values() for name, _ in menus]
+
+    elif query_type == "recommend":
+        context = build_full_menu_summary()
+        response_allergens = []
+        sources = []
+
+    else:
+        chunks = rag.query(query, n_results=3)
+        context = ("[레시피 문서 검색 결과]\n" + "\n---\n".join(f"[{c['source']}]\n{c['text']}" for c in chunks)
+                   if chunks else "현재 참조할 데이터가 없습니다.")
+        response_allergens = detect_allergens_in_text(query)
+        sources = list({c["source"] for c in chunks}) if chunks else []
 
     system_msg = SYSTEM_PROMPT.format(
         allergens=", ".join(ALLERGEN_NAMES),
-        menu_context=menu_context,
-        rag_context=rag_context,
+        context=context,
     )
 
     messages = [{"role": "system", "content": system_msg}]
@@ -166,12 +242,11 @@ async def chat(req: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ollama 오류: {e}")
 
-    detected = list({a for _, info in matched_menus for a in info.get("allergens", [])}) or detect_allergens_in_text(query + " " + answer)
-
     return JSONResponse({
         "answer": answer,
-        "detected_allergens": detected,
-        "sources": [name for name, _ in matched_menus] or list({c["source"] for c in chunks}),
+        "detected_allergens": response_allergens,
+        "sources": list(dict.fromkeys(sources)),  # 중복 제거, 순서 유지
+        "query_type": query_type,
     })
 
 
