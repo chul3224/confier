@@ -30,14 +30,22 @@ def load_menu_db():
             menu_db = json.load(f)
 
 
+import re as _re
+
+_SKIP_TOKENS = {"코스", "단품", "잠실", "3가지"}
+
 def find_matching_menus(query: str) -> list[tuple[str, dict]]:
-    """쿼리에서 메뉴명 매칭 (부분 일치)."""
+    """쿼리에서 메뉴명 매칭 — _와 공백 모두 분리, 양방향 포함 검사."""
     matches = []
     q = query.lower().replace(" ", "")
     for name, info in menu_db.items():
-        # 시트명의 메뉴 키워드 부분 추출 (코스_, 단품_ 제거)
-        keywords = name.lower().replace("코스_", "").replace("단품_", "").replace("잠실_단품_", "").replace(" ", "")
-        if any(kw in q for kw in keywords.split("_") if len(kw) > 1):
+        # 메뉴명을 _ 와 공백으로 분리해 의미 있는 토큰 추출
+        tokens = [t for t in _re.split(r"[_\s]+", name.lower())
+                  if len(t) > 1 and t not in _SKIP_TOKENS]
+        # 메뉴 토큰이 쿼리에 포함되거나, 쿼리 단어가 메뉴명에 포함되면 매칭
+        name_flat = name.lower().replace(" ", "")
+        query_words = [w for w in _re.split(r"\s+", query.lower()) if len(w) > 1]
+        if any(t in q for t in tokens) or any(w in name_flat for w in query_words):
             matches.append((name, info))
     return matches
 

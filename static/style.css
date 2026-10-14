@@ -86,15 +86,65 @@ header .subtitle { font-size: 0.85rem; opacity: 0.85; margin-top: 4px; }
 .status-msg.success { color: #38a169; }
 .status-msg.loading { color: #888; }
 
+.db-status {
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding: 6px 10px;
+  border-radius: 8px;
+  margin-bottom: 8px;
+}
+.db-status.ok { background: #d8f3dc; color: #1b4332; }
+.db-status.error { background: #ffe5e5; color: #c53030; }
+.db-status.loading { background: #f0f0f0; color: #888; }
+
 .file-list {
   list-style: none;
-  font-size: 0.82rem;
+  font-size: 0.8rem;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
+  max-height: 220px;
+  overflow-y: auto;
 }
 
 .file-list .empty { color: #aaa; }
+
+.file-list .cat-header {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: #2d6a4f;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-top: 6px;
+  padding-bottom: 2px;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.file-list .menu-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  color: #444;
+  cursor: default;
+}
+.file-list .menu-item:hover { background: #f0f4f1; }
+
+.count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  background: #ffe5e5;
+  color: #c53030;
+  flex-shrink: 0;
+}
+.count-badge.safe { background: #d8f3dc; color: #1b4332; }
 
 .allergen-tags {
   display: flex;
