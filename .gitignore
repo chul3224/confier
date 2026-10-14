@@ -5,3 +5,4 @@ chroma_db/
 .env
 .DS_Store
 documents/*.pdf
+documents/*.xlsx

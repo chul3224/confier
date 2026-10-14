@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 from contextlib import asynccontextmanager
@@ -16,12 +17,48 @@ from rag import RecipeRAG
 
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
 DOCUMENTS_DIR = Path("documents")
+MENU_JSON = Path("data/menu_allergens.json")
+
 rag: RecipeRAG | None = None
+menu_db: dict = {}
+
+
+def load_menu_db():
+    global menu_db
+    if MENU_JSON.exists():
+        with open(MENU_JSON, encoding="utf-8") as f:
+            menu_db = json.load(f)
+
+
+def find_matching_menus(query: str) -> list[tuple[str, dict]]:
+    """쿼리에서 메뉴명 매칭 (부분 일치)."""
+    matches = []
+    q = query.lower().replace(" ", "")
+    for name, info in menu_db.items():
+        # 시트명의 메뉴 키워드 부분 추출 (코스_, 단품_ 제거)
+        keywords = name.lower().replace("코스_", "").replace("단품_", "").replace("잠실_단품_", "").replace(" ", "")
+        if any(kw in q for kw in keywords.split("_") if len(kw) > 1):
+            matches.append((name, info))
+    return matches
+
+
+def build_menu_context(matches: list[tuple[str, dict]]) -> str:
+    if not matches:
+        return ""
+    lines = ["[메뉴 알러지 데이터베이스 조회 결과]"]
+    for name, info in matches:
+        allergen_str = ", ".join(info["allergens"]) if info["allergens"] else "없음"
+        lines.append(f"\n● {name} ({info['category']})")
+        lines.append(f"  알러지: {allergen_str}")
+        for a, srcs in info.get("allergen_sources", {}).items():
+            lines.append(f"  - {a} 유발 재료: {', '.join(srcs)}")
+    return "\n".join(lines)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global rag
+    load_menu_db()
     rag = RecipeRAG()
     rag.index_documents()
     yield
@@ -37,15 +74,17 @@ SYSTEM_PROMPT = """당신은 레시피 알러지 전문가 챗봇입니다.
 
 식약처 알러지 유발 22종: {allergens}
 
-아래는 관련 레시피 정보입니다:
-{recipe_context}
+{menu_context}
+
+{rag_context}
 
 답변 규칙:
-1. 레시피에 포함된 알러지 유발 성분을 정확히 나열하세요.
-2. 알러지가 없으면 안전하다고 알려주세요.
-3. 가능하면 대체 재료를 제안하세요.
-4. 불확실한 경우 솔직히 말씀해주세요.
-5. 한국어로 답변하세요."""
+1. 메뉴 데이터베이스 조회 결과가 있으면 그것을 우선으로 답변하세요.
+2. 알러지 유발 성분과 그 유발 재료를 명확히 알려주세요.
+3. 알러지가 없으면 안전하다고 알려주세요.
+4. 레시피 세부 내용(배합비율, 조리법)은 답변에 포함하지 마세요.
+5. 불확실한 경우 솔직히 말씀해주세요.
+6. 한국어로 답변하세요."""
 
 
 class ChatRequest(BaseModel):
@@ -64,17 +103,26 @@ async def chat(req: ChatRequest):
     if not query:
         raise HTTPException(status_code=400, detail="메시지를 입력해주세요.")
 
-    chunks = rag.query(query)
+    # 1. 메뉴 DB 직접 조회
+    matched_menus = find_matching_menus(query)
+    menu_context = build_menu_context(matched_menus)
+
+    # 2. RAG 보조 검색
+    chunks = rag.query(query, n_results=2) if not matched_menus else []
     if chunks:
-        recipe_context = "\n\n---\n\n".join(
+        rag_context = "[레시피 문서 검색 결과]\n" + "\n\n---\n\n".join(
             f"[{c['source']}]\n{c['text']}" for c in chunks
         )
     else:
-        recipe_context = "현재 인덱싱된 레시피 문서가 없습니다. PDF를 업로드해주세요."
+        rag_context = ""
+
+    if not menu_context and not rag_context:
+        rag_context = "현재 참조할 레시피 데이터가 없습니다."
 
     system_msg = SYSTEM_PROMPT.format(
         allergens=", ".join(ALLERGEN_NAMES),
-        recipe_context=recipe_context,
+        menu_context=menu_context,
+        rag_context=rag_context,
     )
 
     messages = [{"role": "system", "content": system_msg}]
@@ -88,12 +136,12 @@ async def chat(req: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ollama 오류: {e}")
 
-    detected = detect_allergens_in_text(query + " " + answer)
+    detected = list({a for _, info in matched_menus for a in info.get("allergens", [])}) or detect_allergens_in_text(query + " " + answer)
 
     return JSONResponse({
         "answer": answer,
         "detected_allergens": detected,
-        "sources": list({c["source"] for c in chunks}),
+        "sources": [name for name, _ in matched_menus] or list({c["source"] for c in chunks}),
     })
 
 
@@ -101,30 +149,32 @@ async def chat(req: ChatRequest):
 async def upload_pdf(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="PDF 파일만 업로드 가능합니다.")
-
     dest = DOCUMENTS_DIR / file.filename
     with dest.open("wb") as f:
         shutil.copyfileobj(file.file, f)
-
     result = rag.index_documents()
-    return JSONResponse({
-        "message": f"{file.filename} 업로드 완료",
-        "indexed": result["indexed"],
-    })
+    return JSONResponse({"message": f"{file.filename} 업로드 완료", "indexed": result["indexed"]})
 
 
 @app.get("/status")
 async def status():
-    indexed_files = rag.get_indexed_files()
     return JSONResponse({
-        "indexed_files": indexed_files,
+        "indexed_files": rag.get_indexed_files(),
+        "menu_db_count": len(menu_db),
         "model": OLLAMA_MODEL,
         "allergens": ALLERGEN_NAMES,
+    })
+
+
+@app.get("/menus")
+async def list_menus():
+    return JSONResponse({
+        name: {"category": info["category"], "allergens": info["allergens"]}
+        for name, info in menu_db.items()
     })
 
 
 @app.post("/reindex")
 async def reindex():
     rag.reset()
-    result = rag.index_documents()
-    return JSONResponse(result)
+    return JSONResponse(rag.index_documents())
