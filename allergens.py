@@ -25,6 +25,32 @@ KOREAN_ALLERGENS = {
 
 ALLERGEN_NAMES = list(KOREAN_ALLERGENS.keys())
 
+# 교차 반응 가능성이 있는 유사 알러지 그룹
+SIMILAR_ALLERGENS: dict[str, list[str]] = {
+    # 견과류 그룹 — 땅콩(콩과)은 엄밀히 다르지만 임상적으로 교차 반응 빈번
+    "땅콩":     ["아몬드", "캐슈넛", "피스타치오", "호두", "잣"],
+    "아몬드":   ["땅콩", "캐슈넛", "피스타치오", "호두", "잣"],
+    "캐슈넛":   ["땅콩", "아몬드", "피스타치오", "호두", "잣"],
+    "피스타치오":["땅콩", "아몬드", "캐슈넛", "호두", "잣"],
+    "호두":     ["땅콩", "아몬드", "캐슈넛", "피스타치오", "잣"],
+    "잣":       ["땅콩", "아몬드", "캐슈넛", "피스타치오", "호두"],
+    # 갑각류 그룹
+    "게":       ["새우"],
+    "새우":     ["게"],
+    # 해산물 그룹
+    "조개류":   ["오징어"],
+    "오징어":   ["조개류"],
+    # 유제품 그룹
+    "우유":     [],
+    # 곡물 그룹
+    "밀":       ["메밀"],
+    "메밀":     ["밀"],
+}
+
+
+def get_similar_allergens(allergen: str) -> list[str]:
+    return SIMILAR_ALLERGENS.get(allergen, [])
+
 
 def detect_allergens_in_text(text: str) -> list[str]:
     text_lower = text.lower()

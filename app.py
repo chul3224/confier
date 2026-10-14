@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from allergens import ALLERGEN_NAMES, detect_allergens_in_text
+from allergens import ALLERGEN_NAMES, detect_allergens_in_text, get_similar_allergens
 from rag import RecipeRAG
 
 
@@ -69,6 +69,24 @@ def find_menus_by_allergen(allergens: list[str]) -> dict[str, list[tuple]]:
     return result
 
 
+def find_menus_by_similar_allergens(allergens: list[str]) -> dict[str, list[tuple]]:
+    """유사 알러지 그룹에 속하는 다른 알러지 포함 메뉴 조회."""
+    result = {}
+    seen = set(allergens)  # 이미 직접 조회한 알러지는 제외
+    for allergen in allergens:
+        for similar in get_similar_allergens(allergen):
+            if similar in seen:
+                continue
+            affected = [
+                (name, info) for name, info in menu_db.items()
+                if similar in info.get("allergens", [])
+            ]
+            if affected:
+                result[similar] = affected
+            seen.add(similar)
+    return result
+
+
 def build_menu_context(matches: list[tuple[str, dict]]) -> str:
     lines = ["[메뉴 알러지 DB 조회 결과]"]
     for name, info in matches:
@@ -83,7 +101,8 @@ def build_menu_context(matches: list[tuple[str, dict]]) -> str:
 _SAFE_MENU_KW = ["주문 가능", "먹을 수 있", "괜찮", "안전", "추천", "피해서", "제외하고", "뭐 먹"]
 
 
-def build_allergen_context(allergen_results: dict[str, list], show_safe: bool = False) -> str:
+def build_allergen_context(allergen_results: dict[str, list], show_safe: bool = False,
+                           similar_results: dict[str, list] | None = None) -> str:
     """알러지 역방향 조회 결과 컨텍스트. show_safe=True면 안전 메뉴 목록도 포함."""
     lines = ["[알러지 기반 메뉴 조회 결과]"]
     dangerous_names: set[str] = set()
@@ -98,8 +117,19 @@ def build_allergen_context(allergen_results: dict[str, list], show_safe: bool = 
                 lines.append(f"  ✗ {name} ({info['category']}) / 유발 재료: {', '.join(srcs)}")
                 dangerous_names.add(name)
 
+    # 유사 알러지 포함 메뉴 섹션
+    if similar_results:
+        lines.append("\n[유사 제품 주의 — 교차 반응 가능성]")
+        for similar_allergen, menus in similar_results.items():
+            lines.append(f"\n⚠ {similar_allergen} 포함 메뉴 ({len(menus)}개) — 교차 반응 주의:")
+            for name, info in menus:
+                srcs = info["allergen_sources"].get(similar_allergen, [])
+                lines.append(f"  △ {name} ({info['category']}) / 유발 재료: {', '.join(srcs)}")
+
     if show_safe and menu_db:
-        safe = [(n, i) for n, i in menu_db.items() if n not in dangerous_names]
+        similar_names = {n for menus in (similar_results or {}).values() for n, _ in menus}
+        safe = [(n, i) for n, i in menu_db.items()
+                if n not in dangerous_names and n not in similar_names]
         if safe:
             lines.append(f"\n● 주문 가능 메뉴 ({len(safe)}개):")
             for name, info in safe:
@@ -161,9 +191,11 @@ SYSTEM_PROMPT = """당신은 홀 직원을 위한 레시피 알러지 안내 챗
 [답변 규칙]
 1. 조회 결과가 있으면 반드시 그 데이터를 근거로 답변하세요.
 2. 알러지 포함 여부와 유발 재료를 명확히 안내하세요.
-3. 레시피 세부 내용(배합비율, 조리법)은 절대 포함하지 마세요.
-4. 대체 재료 제안은 현재 지원되지 않습니다. 요청 시 "추후 업데이트 예정"이라고만 답하세요.
-5. 짧고 명확하게 한국어로 답변하세요."""
+3. '[유사 제품 주의]' 섹션이 있으면 반드시 포함하여 안내하세요.
+   교차 반응 가능성이 있으므로 해당 메뉴를 주문 전 확인 권고로 안내하세요.
+4. 레시피 세부 내용(배합비율, 조리법)은 절대 포함하지 마세요.
+5. 대체 재료 제안은 현재 지원되지 않습니다. 요청 시 "추후 업데이트 예정"이라고만 답하세요.
+6. 짧고 명확하게 한국어로 답변하세요."""
 
 
 # ─────────────────────────────────────────────
@@ -209,10 +241,14 @@ async def chat(req: ChatRequest):
 
     elif query_type == "allergen":
         allergen_results = find_menus_by_allergen(data)
+        similar_results = find_menus_by_similar_allergens(data)
         show_safe = any(kw in query for kw in _SAFE_MENU_KW)
-        context = build_allergen_context(allergen_results, show_safe=show_safe)
-        response_allergens = data
-        sources = [name for menus in allergen_results.values() for name, _ in menus]
+        context = build_allergen_context(allergen_results, show_safe=show_safe,
+                                         similar_results=similar_results or None)
+        response_allergens = data + list(similar_results.keys())
+        direct_sources = [name for menus in allergen_results.values() for name, _ in menus]
+        similar_sources = [name for menus in similar_results.values() for name, _ in menus]
+        sources = list(dict.fromkeys(direct_sources + similar_sources))
 
     elif query_type == "recommend":
         context = build_full_menu_summary()
