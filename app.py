@@ -55,6 +55,23 @@ def build_menu_context(matches: list[tuple[str, dict]]) -> str:
     return "\n".join(lines)
 
 
+def build_full_menu_summary() -> str:
+    """전체 메뉴 알러지 요약 (추천/회피 질문용)."""
+    if not menu_db:
+        return ""
+    lines = ["[전체 메뉴 알러지 현황]"]
+    for name, info in menu_db.items():
+        allergen_str = ", ".join(info["allergens"]) if info["allergens"] else "없음"
+        lines.append(f"  {name}: {allergen_str}")
+    return "\n".join(lines)
+
+
+RECOMMEND_KEYWORDS = ["추천", "먹을 수 있", "괜찮은", "안전한", "피해야", "어떤 메뉴", "뭐 먹", "전체", "모든 메뉴"]
+
+def is_recommendation_query(query: str) -> bool:
+    return any(kw in query for kw in RECOMMEND_KEYWORDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global rag
@@ -105,7 +122,12 @@ async def chat(req: ChatRequest):
 
     # 1. 메뉴 DB 직접 조회
     matched_menus = find_matching_menus(query)
-    menu_context = build_menu_context(matched_menus)
+    if matched_menus:
+        menu_context = build_menu_context(matched_menus)
+    elif is_recommendation_query(query):
+        menu_context = build_full_menu_summary()
+    else:
+        menu_context = ""
 
     # 2. RAG 보조 검색
     chunks = rag.query(query, n_results=2) if not matched_menus else []
